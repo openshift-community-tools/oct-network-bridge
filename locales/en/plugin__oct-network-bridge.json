@@ -185,5 +185,9 @@
   "{{address}} ({{node}}) is the gateway address": "{{address}} ({{node}}) is the gateway address",
   "{{address}} ({{node}}) is not in the gateway subnet {{subnet}}": "{{address}} ({{node}}) is not in the gateway subnet {{subnet}}",
   "The node addresses are in different /{{prefix}} subnets: {{subnets}}": "The node addresses are in different /{{prefix}} subnets: {{subnets}}",
-  "{{address}} is already configured on {{iface}} on node {{node}}": "{{address}} is already configured on {{iface}} on node {{node}}"
+  "{{address}} is already configured on {{iface}} on node {{node}}": "{{address}} is already configured on {{iface}} on node {{node}}",
+  "Not created": "Not created",
+  "Untick nodes to leave them out. When only some nodes of a pool are selected, or with static IPv4, one policy is created per node, and the policies are applied one after another. Per-node policies do not cover nodes that join the pool later.": "Untick nodes to leave them out. When only some nodes of a pool are selected, or with static IPv4, one policy is created per node, and the policies are applied one after another. Per-node policies do not cover nodes that join the pool later.",
+  "A /32 address has no gateway on its subnet. Leave the gateway empty or use a shorter prefix length.": "A /32 address has no gateway on its subnet. Leave the gateway empty or use a shorter prefix length.",
+  "The gateway adds a default route on {{iface}} next to the one on br-ex, the cluster default network. Traffic that should leave through br-ex may leave through this interface instead. Leave the gateway empty unless this network must carry the default route.": "The gateway adds a default route on {{iface}} next to the one on br-ex, the cluster default network. Traffic that should leave through br-ex may leave through this interface instead. Leave the gateway empty unless this network must carry the default route."
 }

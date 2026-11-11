@@ -226,6 +226,7 @@ const NetworkBridgePage: FC = () => {
 
   /* ---- action state ---- */
   const [creating, setCreating] = useState(false);
+  const [createPhase, setCreatePhase] = useState('');
   const [createError, setCreateError] = useState<string | null>(null);
   const [created, setCreated] = useState<{ policyNames: string[]; bridgeName: string }>({
     policyNames: [],
@@ -349,7 +350,8 @@ const NetworkBridgePage: FC = () => {
   const ipv4: BridgeIpv4Config = useMemo(
     () => ({
       mode: ipv4Mode,
-      prefixLength: parseInt(prefixLength, 10) || 24,
+      // Bad input stays NaN so the address checks report it instead of using 24.
+      prefixLength: /^\s*\d+\s*$/.test(prefixLength) ? parseInt(prefixLength, 10) : NaN,
       gateway,
     }),
     [ipv4Mode, prefixLength, gateway],
@@ -406,6 +408,7 @@ const NetworkBridgePage: FC = () => {
         prefixLength: ipv4.prefixLength ?? 24,
         gateway: ipv4.gateway,
         nns,
+        targetInterface: bridgeName.trim(),
       });
       issues.push(...addressCheck.issues);
       warnings.push(...addressCheck.warnings);
@@ -620,6 +623,47 @@ const NetworkBridgePage: FC = () => {
     }
   }, [affectedPods, t]);
 
+  const waitForNncpApply = useCallback(
+    async (
+      name: string,
+      minGeneration: number,
+      startedAtMs: number,
+      onPhase: (message: string) => void = setRemovePhase,
+    ) => {
+      const deadline = Date.now() + NNCP_APPLY_TIMEOUT_MS;
+      while (Date.now() < deadline) {
+        const nncp = (await k8sGet({
+          model: NodeNetworkConfigurationPolicyModel,
+          name,
+        })) as NncpKind;
+        const outcome = nncpApplyOutcome(nncp, {
+          minGeneration,
+          startedAtMs,
+          nnces: nncesRef.current,
+        });
+        const progress = nnceProgressSummary(nncesRef.current, name, minGeneration);
+        if (progress.total > 0) {
+          onPhase(
+            t('Waiting for NMState to apply {{name}} ({{ready}}/{{total}} nodes)...', {
+              name,
+              ready: String(progress.ready),
+              total: String(progress.total),
+            }),
+          );
+        } else {
+          onPhase(t('Waiting for NMState to apply {{name}}...', { name }));
+        }
+        if (outcome === 'success') return;
+        if (outcome === 'failed') {
+          throw new Error(nncpFailMessage(nncp));
+        }
+        await sleep(NNCP_APPLY_POLL_MS);
+      }
+      throw new Error(t('Timed out waiting for NMState to apply {{name}}', { name }));
+    },
+    [t],
+  );
+
   const handleCreate = useCallback(async () => {
     if (plan.policies.length === 0 || plan.issues.length > 0) return;
     setCreating(true);
@@ -634,12 +678,23 @@ const NetworkBridgePage: FC = () => {
 
     const succeeded: string[] = [];
     try {
-      for (const policy of plan.policies) {
+      // maxUnavailable only throttles within one policy. With several policies
+      // (one per node, or one per pool) the next is created only after NMState
+      // has applied the previous one, so nodes never reconfigure all at once
+      // and a failing policy stops the rollout.
+      for (let i = 0; i < plan.policies.length; i++) {
+        const policy = plan.policies[i];
+        const startedAtMs = Date.now();
         await k8sCreate({
           model: NodeNetworkConfigurationPolicyModel,
           data: policy as unknown as K8sResourceCommon,
         });
         succeeded.push(policy.metadata.name);
+        // Record progress so the plan does not flag the bridge name as taken.
+        setCreated({ policyNames: [...succeeded], bridgeName: bridgeName.trim() });
+        if (i < plan.policies.length - 1) {
+          await waitForNncpApply(policy.metadata.name, 1, startedAtMs, setCreatePhase);
+        }
       }
       dashboardLogger.info(LOG_ACTION, 'Create succeeded', succeeded.join(', '));
       setCreated({ policyNames: succeeded, bridgeName: bridgeName.trim() });
@@ -651,18 +706,29 @@ const NetworkBridgePage: FC = () => {
     } catch (err) {
       const msg = getK8sErrorMessage(err);
       dashboardLogger.error(LOG_ACTION, 'Create failed', msg);
+      const notCreated = plan.policies.map((p) => p.metadata.name).filter((n) => !succeeded.includes(n));
       const suffix =
-        succeeded.length > 0
-          ? ` ${t('Created before failure')}: ${succeeded.join(', ')}.`
-          : '';
+        (succeeded.length > 0 ? ` ${t('Created before failure')}: ${succeeded.join(', ')}.` : '') +
+        (notCreated.length > 0 ? ` ${t('Not created')}: ${notCreated.join(', ')}.` : '');
       setCreateError(`${msg}${suffix}`);
       if (succeeded.length > 0) {
         setCreated({ policyNames: succeeded, bridgeName: bridgeName.trim() });
       }
     } finally {
       setCreating(false);
+      setCreatePhase('');
     }
-  }, [plan.policies, plan.issues.length, bridgeName, bridgeType, selectedPort, t, portShareSummary, loadAffectedPods]);
+  }, [
+    plan.policies,
+    plan.issues.length,
+    bridgeName,
+    bridgeType,
+    selectedPort,
+    t,
+    portShareSummary,
+    loadAffectedPods,
+    waitForNncpApply,
+  ]);
 
   const handleCreateAnother = useCallback(() => {
     const nextName = suggestBridgeName(usedBridgeNames, bridgeType);
@@ -674,42 +740,6 @@ const NetworkBridgePage: FC = () => {
     setEnableVlan(false);
     setVlanId('');
   }, [usedBridgeNames, bridgeType, clearCreated]);
-
-  const waitForNncpApply = useCallback(
-    async (name: string, minGeneration: number, startedAtMs: number) => {
-      const deadline = Date.now() + NNCP_APPLY_TIMEOUT_MS;
-      while (Date.now() < deadline) {
-        const nncp = (await k8sGet({
-          model: NodeNetworkConfigurationPolicyModel,
-          name,
-        })) as NncpKind;
-        const outcome = nncpApplyOutcome(nncp, {
-          minGeneration,
-          startedAtMs,
-          nnces: nncesRef.current,
-        });
-        const progress = nnceProgressSummary(nncesRef.current, name, minGeneration);
-        if (progress.total > 0) {
-          setRemovePhase(
-            t('Waiting for NMState to apply {{name}} ({{ready}}/{{total}} nodes)...', {
-              name,
-              ready: String(progress.ready),
-              total: String(progress.total),
-            }),
-          );
-        } else {
-          setRemovePhase(t('Waiting for NMState to apply {{name}}...', { name }));
-        }
-        if (outcome === 'success') return;
-        if (outcome === 'failed') {
-          throw new Error(nncpFailMessage(nncp));
-        }
-        await sleep(NNCP_APPLY_POLL_MS);
-      }
-      throw new Error(t('Timed out waiting for NMState to apply {{name}}', { name }));
-    },
-    [t],
-  );
 
   const closeRemoveModal = useCallback(() => {
     if (removing) return;
@@ -1077,7 +1107,7 @@ const NetworkBridgePage: FC = () => {
                             <FormHelperText>
                               <HelperText>
                                 <HelperTextItem>
-                                  {t('Untick nodes to leave them out. When only some nodes of a pool are selected, or with static IPv4, one policy is created per node.')}
+                                  {t('Untick nodes to leave them out. When only some nodes of a pool are selected, or with static IPv4, one policy is created per node, and the policies are applied one after another. Per-node policies do not cover nodes that join the pool later.')}
                                 </HelperTextItem>
                               </HelperText>
                             </FormHelperText>
@@ -1824,6 +1854,12 @@ const NetworkBridgePage: FC = () => {
                       </StackItem>
                     )}
 
+                    {creating && createPhase && (
+                      <StackItem>
+                        <Alert variant="info" isInline title={createPhase} />
+                      </StackItem>
+                    )}
+
                     {createError && (
                       <StackItem>
                         <Alert variant="danger" title={t('Failed to create bridge')} isInline>
@@ -1832,7 +1868,7 @@ const NetworkBridgePage: FC = () => {
                       </StackItem>
                     )}
 
-                    {createdNames.length > 0 && (
+                    {createdNames.length > 0 && !creating && (
                       <StackItem>
                         <Alert variant="success" title={t('Bridge created')} isInline>
                           <p>{t('Created {{names}}.', { names: createdNames.join(', ') })}</p>
@@ -1863,7 +1899,7 @@ const NetworkBridgePage: FC = () => {
                           >
                             {creating ? t('Creating...') : t('Create')}
                           </Button>
-                          {createdNames.length > 0 && (
+                          {createdNames.length > 0 && !creating && (
                             <Button variant="secondary" onClick={handleCreateAnother}>
                               {t('Create another bridge')}
                             </Button>
