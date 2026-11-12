@@ -117,6 +117,13 @@ import {
   validateIpv4,
   validateVlanId,
 } from '../utils/network-bridge';
+import {
+  checkNodeAddresses,
+  fillSequentialAddresses,
+  isIpv4,
+  perNodeTargets,
+  selectTargetNodes,
+} from '../utils/node-ipv4';
 import { toYaml } from '../utils/yaml';
 import dashboardLogger from '../utils/logger';
 import CommunityDisclaimer from './CommunityDisclaimer';
@@ -210,12 +217,16 @@ const NetworkBridgePage: FC = () => {
   const [allowExtraPatchPorts, setAllowExtraPatchPorts] = useState(true);
   const [ovnMappings, setOvnMappings] = useState<OvnBridgeMapping[]>([{ localnet: '', bridge: '' }]);
   const [ipv4Mode, setIpv4Mode] = useState<Ipv4Mode>('none');
-  const [ipAddress, setIpAddress] = useState('');
   const [prefixLength, setPrefixLength] = useState('24');
   const [gateway, setGateway] = useState('');
+  /** Nodes of the selected pools the user left out (new pool members start included). */
+  const [excludedNodeNames, setExcludedNodeNames] = useState<string[]>([]);
+  /** Static IPv4 address per node name. */
+  const [nodeAddresses, setNodeAddresses] = useState<Record<string, string>>({});
 
   /* ---- action state ---- */
   const [creating, setCreating] = useState(false);
+  const [createPhase, setCreatePhase] = useState('');
   const [createError, setCreateError] = useState<string | null>(null);
   const [created, setCreated] = useState<{ policyNames: string[]; bridgeName: string }>({
     policyNames: [],
@@ -277,10 +288,21 @@ const NetworkBridgePage: FC = () => {
     [nns, nncps, nodes, scopeNodeNames],
   );
 
-  const targetNodeNames = useMemo(
+  /** Every node of the selected pools. */
+  const poolNodeNames = useMemo(
     () => Array.from(new Set(selectedGroups.flatMap((g) => g.nodeNames))).sort(),
     [selectedGroups],
   );
+  /** The pool nodes the bridge is applied to. */
+  const targetNodeNames = useMemo(
+    () => selectTargetNodes(poolNodeNames, excludedNodeNames),
+    [poolNodeNames, excludedNodeNames],
+  );
+  /**
+   * One policy per node (hostname selector) when the user narrowed the pools to
+   * some of their nodes, or when each node gets its own static address.
+   */
+  const perNodeMode = ipv4Mode === 'static' || targetNodeNames.length < poolNodeNames.length;
 
   const layoutNics: LayoutNic[] = useMemo(() => {
     if (!selectedFingerprint) return [];
@@ -316,15 +338,23 @@ const NetworkBridgePage: FC = () => {
     setOvnMappings([{ localnet: '', bridge: bridgeName }]);
   }, [bridgeName]);
 
+  useEffect(() => {
+    // Forget exclusions of nodes that are no longer in any selected pool.
+    setExcludedNodeNames((prev) => {
+      const next = prev.filter((n) => poolNodeNames.includes(n));
+      return next.length === prev.length ? prev : next;
+    });
+  }, [poolNodeNames]);
+
   /* ---- ipv4 config ---- */
   const ipv4: BridgeIpv4Config = useMemo(
     () => ({
       mode: ipv4Mode,
-      address: ipAddress,
-      prefixLength: parseInt(prefixLength, 10) || 24,
+      // Bad input stays NaN so the address checks report it instead of using 24.
+      prefixLength: /^\s*\d+\s*$/.test(prefixLength) ? parseInt(prefixLength, 10) : NaN,
       gateway,
     }),
-    [ipv4Mode, ipAddress, prefixLength, gateway],
+    [ipv4Mode, prefixLength, gateway],
   );
 
   /* ---- shared ports ---- */
@@ -360,6 +390,8 @@ const NetworkBridgePage: FC = () => {
 
     if (selectedGroups.length === 0) {
       issues.push({ key: 'Select at least one MachineConfigPool' });
+    } else if (targetNodeNames.length === 0) {
+      issues.push({ key: 'Select at least one node' });
     }
 
     if (!selectedPort) {
@@ -369,8 +401,21 @@ const NetworkBridgePage: FC = () => {
     const nameIssue = validateBridgeName(bridgeName);
     if (nameIssue) issues.push(nameIssue);
 
-    const ipv4Issue = validateIpv4(ipv4);
-    if (ipv4Issue) issues.push(ipv4Issue);
+    if (ipv4.mode === 'static') {
+      const addressCheck = checkNodeAddresses({
+        nodeNames: targetNodeNames,
+        addresses: nodeAddresses,
+        prefixLength: ipv4.prefixLength ?? 24,
+        gateway: ipv4.gateway,
+        nns,
+        targetInterface: bridgeName.trim(),
+      });
+      issues.push(...addressCheck.issues);
+      warnings.push(...addressCheck.warnings);
+    } else {
+      const ipv4Issue = validateIpv4(ipv4);
+      if (ipv4Issue) issues.push(ipv4Issue);
+    }
 
     if (enableVlan && vlanId) {
       const vlanIssue = validateVlanId(vlanId);
@@ -380,12 +425,6 @@ const NetworkBridgePage: FC = () => {
     if (selectedPort && mtuApplies) {
       const mtuIssue = validateMtu(mtu, portMtu.limit, selectedPort);
       if (mtuIssue) issues.push(mtuIssue);
-    }
-
-    if (ipv4.mode === 'static' && targetNodeNames.length > 1) {
-      issues.push({
-        key: 'Static IPv4 can only be applied when a single node is targeted. Use L2 only or DHCP for multiple nodes.',
-      });
     }
 
     if (bridgeName.trim() && usedBridgeNames.has(bridgeName.trim()) && !created.policyNames.length) {
@@ -425,19 +464,29 @@ const NetworkBridgePage: FC = () => {
       return { policies: [] as NncpResource[], issues, warnings, targetNodeNames };
     }
 
-    const { targets } = planNncpTargets(selectedGroups);
+    const mcpPlan = planNncpTargets(selectedGroups);
     const selectedMcpSuffix = selectedGroups
       .map((g) => g.mcpName)
       .sort()
       .join('-');
 
+    const targets: { nodeSelector: Record<string, string>; policyName: string; nodeName?: string }[] =
+      perNodeMode || mcpPlan.mode === 'per-node'
+        ? perNodeTargets(targetNodeNames, bridgeName.trim(), sanitizeK8sName)
+        : mcpPlan.targets.map((target) => ({
+            nodeSelector: target.nodeSelector,
+            policyName:
+              mcpPlan.targets.length === 1
+                ? sanitizeK8sName(`${bridgeName.trim()}-${selectedMcpSuffix}`)
+                : sanitizeK8sName(`${bridgeName.trim()}-${target.mcpName || 'node'}`),
+          }));
+
     const policies = targets.map((target) => {
-      let policyName: string;
-      if (targets.length === 1) {
-        policyName = sanitizeK8sName(`${bridgeName.trim()}-${selectedMcpSuffix}`);
-      } else {
-        policyName = sanitizeK8sName(`${bridgeName.trim()}-${target.mcpName || 'node'}`);
-      }
+      const policyName = target.policyName;
+      const targetIpv4: BridgeIpv4Config =
+        ipv4.mode === 'static' && target.nodeName
+          ? { ...ipv4, address: (nodeAddresses[target.nodeName] || '').trim() }
+          : ipv4;
 
       const buildOpts: BuildBridgeNncpOpts = {
         bridgeName: bridgeName.trim(),
@@ -451,7 +500,7 @@ const NetworkBridgePage: FC = () => {
           allowExtraPatchPorts: bridgeType === 'ovs-bridge' ? allowExtraPatchPorts : undefined,
         },
         ovnBridgeMappings: bridgeType === 'ovs-bridge' ? ovnMappings.filter((m) => m.localnet.trim()) : undefined,
-        ipv4,
+        ipv4: targetIpv4,
         nodeSelector: target.nodeSelector,
         policyName,
         mtu: mtuApplies ? mtu : undefined,
@@ -474,6 +523,9 @@ const NetworkBridgePage: FC = () => {
     ovnMappings,
     ipv4,
     targetNodeNames,
+    perNodeMode,
+    nodeAddresses,
+    nns,
     usedBridgeNames,
     created.policyNames.length,
     portShares,
@@ -519,6 +571,25 @@ const NetworkBridgePage: FC = () => {
     [clearCreated],
   );
 
+  const toggleNode = useCallback(
+    (name: string, checked: boolean) => {
+      setExcludedNodeNames((prev) => (checked ? prev.filter((x) => x !== name) : [...prev, name]));
+      dashboardLogger.info(LOG_ACTION, 'Node selection changed', `${checked ? 'selected' : 'deselected'} ${name}`);
+      clearCreated();
+    },
+    [clearCreated],
+  );
+
+  const setNodeAddress = useCallback((nodeName: string, value: string) => {
+    setNodeAddresses((prev) => ({ ...prev, [nodeName]: value }));
+  }, []);
+
+  const fillAddresses = useCallback(() => {
+    const first = targetNodeNames[0];
+    if (!first) return;
+    setNodeAddresses((prev) => ({ ...prev, ...fillSequentialAddresses(prev[first] || '', targetNodeNames) }));
+  }, [targetNodeNames]);
+
   const goNetworkHub = () => {
     navigate('/community-tools/network');
   };
@@ -552,6 +623,47 @@ const NetworkBridgePage: FC = () => {
     }
   }, [affectedPods, t]);
 
+  const waitForNncpApply = useCallback(
+    async (
+      name: string,
+      minGeneration: number,
+      startedAtMs: number,
+      onPhase: (message: string) => void = setRemovePhase,
+    ) => {
+      const deadline = Date.now() + NNCP_APPLY_TIMEOUT_MS;
+      while (Date.now() < deadline) {
+        const nncp = (await k8sGet({
+          model: NodeNetworkConfigurationPolicyModel,
+          name,
+        })) as NncpKind;
+        const outcome = nncpApplyOutcome(nncp, {
+          minGeneration,
+          startedAtMs,
+          nnces: nncesRef.current,
+        });
+        const progress = nnceProgressSummary(nncesRef.current, name, minGeneration);
+        if (progress.total > 0) {
+          onPhase(
+            t('Waiting for NMState to apply {{name}} ({{ready}}/{{total}} nodes)...', {
+              name,
+              ready: String(progress.ready),
+              total: String(progress.total),
+            }),
+          );
+        } else {
+          onPhase(t('Waiting for NMState to apply {{name}}...', { name }));
+        }
+        if (outcome === 'success') return;
+        if (outcome === 'failed') {
+          throw new Error(nncpFailMessage(nncp));
+        }
+        await sleep(NNCP_APPLY_POLL_MS);
+      }
+      throw new Error(t('Timed out waiting for NMState to apply {{name}}', { name }));
+    },
+    [t],
+  );
+
   const handleCreate = useCallback(async () => {
     if (plan.policies.length === 0 || plan.issues.length > 0) return;
     setCreating(true);
@@ -566,12 +678,23 @@ const NetworkBridgePage: FC = () => {
 
     const succeeded: string[] = [];
     try {
-      for (const policy of plan.policies) {
+      // maxUnavailable only throttles within one policy. With several policies
+      // (one per node, or one per pool) the next is created only after NMState
+      // has applied the previous one, so nodes never reconfigure all at once
+      // and a failing policy stops the rollout.
+      for (let i = 0; i < plan.policies.length; i++) {
+        const policy = plan.policies[i];
+        const startedAtMs = Date.now();
         await k8sCreate({
           model: NodeNetworkConfigurationPolicyModel,
           data: policy as unknown as K8sResourceCommon,
         });
         succeeded.push(policy.metadata.name);
+        // Record progress so the plan does not flag the bridge name as taken.
+        setCreated({ policyNames: [...succeeded], bridgeName: bridgeName.trim() });
+        if (i < plan.policies.length - 1) {
+          await waitForNncpApply(policy.metadata.name, 1, startedAtMs, setCreatePhase);
+        }
       }
       dashboardLogger.info(LOG_ACTION, 'Create succeeded', succeeded.join(', '));
       setCreated({ policyNames: succeeded, bridgeName: bridgeName.trim() });
@@ -583,18 +706,29 @@ const NetworkBridgePage: FC = () => {
     } catch (err) {
       const msg = getK8sErrorMessage(err);
       dashboardLogger.error(LOG_ACTION, 'Create failed', msg);
+      const notCreated = plan.policies.map((p) => p.metadata.name).filter((n) => !succeeded.includes(n));
       const suffix =
-        succeeded.length > 0
-          ? ` ${t('Created before failure')}: ${succeeded.join(', ')}.`
-          : '';
+        (succeeded.length > 0 ? ` ${t('Created before failure')}: ${succeeded.join(', ')}.` : '') +
+        (notCreated.length > 0 ? ` ${t('Not created')}: ${notCreated.join(', ')}.` : '');
       setCreateError(`${msg}${suffix}`);
       if (succeeded.length > 0) {
         setCreated({ policyNames: succeeded, bridgeName: bridgeName.trim() });
       }
     } finally {
       setCreating(false);
+      setCreatePhase('');
     }
-  }, [plan.policies, plan.issues.length, bridgeName, bridgeType, selectedPort, t, portShareSummary, loadAffectedPods]);
+  }, [
+    plan.policies,
+    plan.issues.length,
+    bridgeName,
+    bridgeType,
+    selectedPort,
+    t,
+    portShareSummary,
+    loadAffectedPods,
+    waitForNncpApply,
+  ]);
 
   const handleCreateAnother = useCallback(() => {
     const nextName = suggestBridgeName(usedBridgeNames, bridgeType);
@@ -606,42 +740,6 @@ const NetworkBridgePage: FC = () => {
     setEnableVlan(false);
     setVlanId('');
   }, [usedBridgeNames, bridgeType, clearCreated]);
-
-  const waitForNncpApply = useCallback(
-    async (name: string, minGeneration: number, startedAtMs: number) => {
-      const deadline = Date.now() + NNCP_APPLY_TIMEOUT_MS;
-      while (Date.now() < deadline) {
-        const nncp = (await k8sGet({
-          model: NodeNetworkConfigurationPolicyModel,
-          name,
-        })) as NncpKind;
-        const outcome = nncpApplyOutcome(nncp, {
-          minGeneration,
-          startedAtMs,
-          nnces: nncesRef.current,
-        });
-        const progress = nnceProgressSummary(nncesRef.current, name, minGeneration);
-        if (progress.total > 0) {
-          setRemovePhase(
-            t('Waiting for NMState to apply {{name}} ({{ready}}/{{total}} nodes)...', {
-              name,
-              ready: String(progress.ready),
-              total: String(progress.total),
-            }),
-          );
-        } else {
-          setRemovePhase(t('Waiting for NMState to apply {{name}}...', { name }));
-        }
-        if (outcome === 'success') return;
-        if (outcome === 'failed') {
-          throw new Error(nncpFailMessage(nncp));
-        }
-        await sleep(NNCP_APPLY_POLL_MS);
-      }
-      throw new Error(t('Timed out waiting for NMState to apply {{name}}', { name }));
-    },
-    [t],
-  );
 
   const closeRemoveModal = useCallback(() => {
     if (removing) return;
@@ -993,6 +1091,28 @@ const NetworkBridgePage: FC = () => {
                             </HelperText>
                           </FormHelperText>
                         </FormGroup>
+                        {poolNodeNames.length > 0 && (
+                          <FormGroup label={t('Nodes')} fieldId="netbridge-nodes" isRequired>
+                            <div className="netbridge-node-list">
+                              {poolNodeNames.map((nodeName) => (
+                                <Checkbox
+                                  key={nodeName}
+                                  id={`netbridge-node-${nodeName}`}
+                                  label={nodeName}
+                                  isChecked={targetNodeNames.includes(nodeName)}
+                                  onChange={(_event, isChecked) => toggleNode(nodeName, Boolean(isChecked))}
+                                />
+                              ))}
+                            </div>
+                            <FormHelperText>
+                              <HelperText>
+                                <HelperTextItem>
+                                  {t('Untick nodes to leave them out. When only some nodes of a pool are selected, or with static IPv4, one policy is created per node, and the policies are applied one after another. Per-node policies do not cover nodes that join the pool later.')}
+                                </HelperTextItem>
+                              </HelperText>
+                            </FormHelperText>
+                          </FormGroup>
+                        )}
                       </Form>
                     </StackItem>
                   </Stack>
@@ -1500,13 +1620,49 @@ const NetworkBridgePage: FC = () => {
 
                     {ipv4Mode === 'static' && (
                       <>
-                        <FormGroup label={t('IP Address')} fieldId="netbridge-ip" isRequired>
-                          <TextInput
-                            id="netbridge-ip"
-                            value={ipAddress}
-                            onChange={(_event, value) => setIpAddress(value)}
-                            placeholder="192.168.1.10"
-                          />
+                        <FormGroup label={t('IP addresses')} fieldId="netbridge-ip" isRequired>
+                          {targetNodeNames.length === 0 ? (
+                            <HelperText>
+                              <HelperTextItem>{t('Select nodes to assign addresses.')}</HelperTextItem>
+                            </HelperText>
+                          ) : (
+                            <>
+                              <Table aria-label={t('IP addresses')} variant="compact">
+                                <Thead>
+                                  <Tr>
+                                    <Th>{t('Node')}</Th>
+                                    <Th>{t('IPv4 address')}</Th>
+                                  </Tr>
+                                </Thead>
+                                <Tbody>
+                                  {targetNodeNames.map((nodeName, i) => (
+                                    <Tr key={nodeName}>
+                                      <Td dataLabel={t('Node')}>{nodeName}</Td>
+                                      <Td dataLabel={t('IPv4 address')}>
+                                        <TextInput
+                                          id={i === 0 ? 'netbridge-ip' : `netbridge-ip-${nodeName}`}
+                                          aria-label={t('IPv4 address for {{node}}', { node: nodeName })}
+                                          value={nodeAddresses[nodeName] || ''}
+                                          onChange={(_event, value) => setNodeAddress(nodeName, value)}
+                                          placeholder="192.168.1.10"
+                                        />
+                                      </Td>
+                                    </Tr>
+                                  ))}
+                                </Tbody>
+                              </Table>
+                              {targetNodeNames.length > 1 && (
+                                <Button
+                                  variant="link"
+                                  isInline
+                                  onClick={fillAddresses}
+                                  isDisabled={!isIpv4(nodeAddresses[targetNodeNames[0]])}
+                                >
+                                  {t('Fill the other nodes sequentially from the first address')}
+                                </Button>
+                              )}
+                            </>
+                          )}
                         </FormGroup>
                         <FormGroup label={t('Prefix Length')} fieldId="netbridge-prefix" isRequired>
                           <TextInput
@@ -1555,7 +1711,7 @@ const NetworkBridgePage: FC = () => {
                 <CardBody>
                   <Stack hasGutter>
                     {plan.warnings.map((w) => (
-                      <StackItem key={w.key}>
+                      <StackItem key={w.key + JSON.stringify(w.values || {})}>
                         <Alert variant="warning" title={t('Warning')} isInline>
                           {t(w.key, w.values)}
                         </Alert>
@@ -1673,7 +1829,9 @@ const NetworkBridgePage: FC = () => {
                               ? t('L2 only (no IP)')
                               : ipv4Mode === 'dhcp'
                                 ? t('DHCP')
-                                : `${ipAddress}/${prefixLength}`}
+                                : targetNodeNames
+                                    .map((n) => `${n}: ${(nodeAddresses[n] || '').trim() || '—'}/${prefixLength}`)
+                                    .join(', ')}
                           </DescriptionListDescription>
                         </DescriptionListGroup>
                         <DescriptionListGroup>
@@ -1696,6 +1854,12 @@ const NetworkBridgePage: FC = () => {
                       </StackItem>
                     )}
 
+                    {creating && createPhase && (
+                      <StackItem>
+                        <Alert variant="info" isInline title={createPhase} />
+                      </StackItem>
+                    )}
+
                     {createError && (
                       <StackItem>
                         <Alert variant="danger" title={t('Failed to create bridge')} isInline>
@@ -1704,7 +1868,7 @@ const NetworkBridgePage: FC = () => {
                       </StackItem>
                     )}
 
-                    {createdNames.length > 0 && (
+                    {createdNames.length > 0 && !creating && (
                       <StackItem>
                         <Alert variant="success" title={t('Bridge created')} isInline>
                           <p>{t('Created {{names}}.', { names: createdNames.join(', ') })}</p>
@@ -1735,7 +1899,7 @@ const NetworkBridgePage: FC = () => {
                           >
                             {creating ? t('Creating...') : t('Create')}
                           </Button>
-                          {createdNames.length > 0 && (
+                          {createdNames.length > 0 && !creating && (
                             <Button variant="secondary" onClick={handleCreateAnother}>
                               {t('Create another bridge')}
                             </Button>

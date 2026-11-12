@@ -3,6 +3,8 @@
  * Supports linux-bridge and ovs-bridge via NMState NodeNetworkConfigurationPolicy.
  */
 
+import { capPolicyName } from './node-ipv4';
+
 /* ------------------------------------------------------------------ */
 /*  Common types                                                       */
 /* ------------------------------------------------------------------ */
@@ -1016,9 +1018,9 @@ export function sanitizeK8sName(raw: string): string {
     .toLowerCase()
     .replace(/[^a-z0-9-]+/g, '-')
     .replace(/-+/g, '-')
-    .replace(/^-+|-+$/g, '')
-    .slice(0, 253);
-  return s || 'netbridge';
+    .replace(/^-+|-+$/g, '');
+  // NNCP names double as the nmstate.io/policy label value on enactments (max 63).
+  return capPolicyName(s || 'netbridge');
 }
 
 export function existingBridgeNamesOnNodes(
